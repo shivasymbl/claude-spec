@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Extract changelog
+        id: changelog
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          NOTES=$(awk -v ver="$VERSION" '
+            /^## \[/ {
+              if (found) exit
+              if ($0 ~ "\\[" ver "\\]") { found=1; next }
+            }
+            found { print }
+          ' CHANGELOG.md)
+
+          if [ -z "$NOTES" ]; then
+            NOTES="Release $VERSION"
+          fi
+
+          # Use heredoc for multiline output
+          {
+            echo "notes<<EOF"
+            echo "$NOTES"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Create plugin archive
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          zip -r "claude-spec-v${VERSION}.zip" \
+            .claude-plugin/ \
+            analyzers/ \
+            commands/ \
+            filters/ \
+            hooks/ \
+            memory/ \
+            skills/ \
+            steps/ \
+            templates/ \
+            utils/ \
+            pyproject.toml \
+            claude-spec.config.json \
+            LICENSE \
+            README.md \
+            CHANGELOG.md \
+            -x "**/__pycache__/*" \
+            -x "**/.pytest_cache/*" \
+            -x "**/.mypy_cache/*" \
+            -x "**/.ruff_cache/*" \
+            -x "*.pyc"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
+        with:
+          name: "v${{ steps.version.outputs.version }}"
+          body: ${{ steps.changelog.outputs.notes }}
+          files: claude-spec-v${{ steps.version.outputs.version }}.zip
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: false

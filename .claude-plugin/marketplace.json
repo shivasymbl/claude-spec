@@ -1,0 +1,21 @@
+{
+  "name": "asymblinc",
+  "owner": {
+    "name": "Asymbl Inc",
+    "email": "engineering@asymbl.com",
+    "url": "https://github.com/asymblinc"
+  },
+  "metadata": {
+    "description": "Claude-Spec: Project specification lifecycle management with strategic planning, implementation tracking, and retrospectives",
+    "version": "0.16.1"
+  },
+  "plugins": [
+    {
+      "name": "claude-spec",
+      "description": "Project specification lifecycle management with strategic planning, implementation tracking, and retrospectives",
+      "source": "./",
+      "version": "0.16.1"
+    }
+  ],
+  "id": "asymblinc"
+}

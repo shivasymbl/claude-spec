@@ -1,0 +1,554 @@
+# claude-spec Technical Architecture
+
+This document describes the internal architecture of the claude-spec plugin.
+
+## Overview
+
+claude-spec is a Claude Code plugin that provides structured project specification and implementation lifecycle management. It consists of three major subsystems:
+
+1. **Command System** - Slash commands for user interaction
+2. **Filter Pipeline** - Content processing and secret detection
+3. **Worktree Manager** - Git worktree automation
+
+## System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              Claude Code CLI                                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                    ┌─────────────────┼─────────────────┐
+                    ▼                 ▼                 ▼
+            ┌───────────────┐ ┌───────────────┐ ┌───────────────┐
+            │   Commands    │ │    Filters    │ │    Skills     │
+            │   (/*)        │ │  (pipeline)   │ │  (worktree)   │
+            └───────────────┘ └───────────────┘ └───────────────┘
+                    │                 │                 │
+                    ▼                 ▼                 ▼
+            ┌─────────────────────────────────────────────────────┐
+            │                   File System                        │
+            │        docs/spec/        │        worktree-reg       │
+            └─────────────────────────────────────────────────────┘
+```
+
+## Component Details
+
+### 1. Plugin Metadata
+
+**Location:** `.claude-plugin/plugin.json`
+
+```json
+{
+  "name": "cs",
+  "version": "1.0.0",
+  "description": "Project specification and lifecycle management"
+}
+```
+
+The plugin is registered in a marketplace at `.claude-plugin/marketplace.json`:
+
+```json
+{
+  "name": "claude-spec-marketplace",
+  "plugins": [
+    {
+      "name": "cs",
+      "path": "./"
+    }
+  ]
+}
+```
+
+### 2. Command System
+
+Commands are Markdown files with YAML frontmatter. Claude Code parses these and exposes them as slash commands.
+
+**Command Resolution:**
+```
+/plan → commands/plan.md
+/worktree-create → commands/worktree-create.md
+```
+
+**Frontmatter Schema:**
+```yaml
+---
+argument-hint: <arg> [optional]    # Shown in autocomplete
+description: Brief description      # Shown in /help
+model: claude-opus-4-5-20251101    # Optional model override
+allowed-tools: Read, Write, Bash   # Tool restrictions
+---
+```
+
+**Command Architecture Pattern:**
+
+```markdown
+<role>
+You are a [Role Name]. Your job is to [responsibility].
+</role>
+
+<command_argument>
+$ARGUMENTS
+</command_argument>
+
+<protocol>
+## Step 1: [Name]
+[Clear instructions]
+
+## Step 2: [Name]
+[More instructions]
+</protocol>
+
+<edge_cases>
+### [Case Name]
+[How to handle]
+</edge_cases>
+```
+
+### 3. Filter Pipeline
+
+**Location:** `filters/`
+
+**Module Structure:**
+```
+filters/
+├── __init__.py      # Package exports
+├── pipeline.py      # Main filter orchestration
+├── log_entry.py     # Log entry data structure
+└── log_writer.py    # Atomic file operations
+```
+
+**Pipeline Flow:**
+
+```
+┌───────────────┐    ┌───────────────┐    ┌───────────────┐
+│ Raw Prompt    │───▶│ Secret Filter │───▶│  Truncation   │
+└───────────────┘    └───────────────┘    └───────────────┘
+                                                   │
+                                                   ▼
+┌───────────────────────────────────────────────────────────┐
+│ FilteredPrompt                                             │
+│ {                                                          │
+│   "filtered_prompt": "...[SECRET:aws_access_key]...",     │
+│   "original_length": 1234,                                │
+│   "was_truncated": false,                                  │
+│   "secrets_found": ["aws_access_key"],                    │
+│   "filter_timestamp": "2025-12-12T..."                    │
+│ }                                                          │
+└───────────────────────────────────────────────────────────┘
+```
+
+**Secret Patterns:**
+
+| Pattern Name | Regex | Replacement |
+|-------------|-------|-------------|
+| AWS Access Key | `A3T[A-Z0-9]\|AKIA\|ASIA...` | `[SECRET:aws_access_key]` |
+| AWS Secret Key | `[A-Za-z0-9/+=]{40}` | `[SECRET:aws_secret_key]` |
+| GitHub PAT | `ghp_[A-Za-z0-9_]{36,}` | `[SECRET:github_token]` |
+| OpenAI Key | `sk-..T3BlbkFJ...` | `[SECRET:openai_key]` |
+| Anthropic Key | `sk-ant-api...` | `[SECRET:anthropic_key]` |
+| JWT | `ey...\.ey...` | `[SECRET:jwt]` |
+| Database URI | `postgres(ql)?://...` | `[SECRET:database_url]` |
+
+### 4. Log Writer
+
+**Atomic Write Pattern:**
+
+```python
+def append_entry(self, entry: LogEntry) -> None:
+    with open(self.log_path, "a", encoding="utf-8") as f:
+        # Acquire exclusive lock
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            f.write(entry.to_json() + "\n")
+            f.flush()
+            os.fsync(f.fileno())  # Ensure write to disk
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+```
+
+This ensures:
+- No partial writes from concurrent access
+- Data is persisted before lock release
+- NDJSON format (one JSON object per line)
+
+### 5. Log Entry Schema
+
+**NDJSON Format:**
+```json
+{"timestamp": "2025-12-12T10:30:00Z", "session_id": "abc123", "prompt": "...", "command": "/plan", "filter_info": {...}}
+{"timestamp": "2025-12-12T10:31:00Z", "session_id": "abc123", "prompt": "...", "command": null, "filter_info": {...}}
+```
+
+**Fields:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `timestamp` | ISO 8601 | When prompt was captured |
+| `session_id` | string | UUID for this Claude Code session |
+| `prompt` | string | Filtered user prompt |
+| `command` | string? | Detected /* command or null |
+| `filter_info` | object | Filtering metadata |
+
+### 6. Worktree Manager
+
+**Location:** `skills/worktree-manager/`
+
+**Components:**
+```
+worktree-manager/
+├── SKILL.md          # Skill documentation & trigger phrases
+├── config.json       # Configuration
+└── scripts/
+    ├── allocate-ports.sh   # Port allocation
+    ├── register.sh         # Registry management
+    ├── release-ports.sh    # Port release
+    ├── launch-agent.sh     # Terminal launching
+    ├── status.sh           # Status reporting
+    └── cleanup.sh          # Cleanup operations
+```
+
+**Global Registry:**
+
+Location: `~/.claude/worktree-registry.json`
+
+```json
+{
+  "worktrees": [
+    {
+      "id": "uuid",
+      "project": "my-project",
+      "branch": "feature/auth",
+      "branchSlug": "feature-auth",
+      "worktreePath": "/Users/.../worktrees/my-project/feature-auth",
+      "repoPath": "/Users/.../my-project",
+      "ports": [8100, 8101],
+      "createdAt": "2025-12-12T10:00:00Z",
+      "status": "active"
+    }
+  ],
+  "portPool": {
+    "start": 8100,
+    "end": 8199,
+    "allocated": [8100, 8101]
+  }
+}
+```
+
+**Port Allocation Algorithm:**
+
+```bash
+# Find first available port in range
+for ((port=PORT_START; port<=PORT_END; port++)); do
+    # Check registry
+    if ! echo "$ALLOCATED_PORTS" | grep -q "^${port}$"; then
+        # Check system
+        if ! lsof -i :"$port" &>/dev/null; then
+            # Port available
+            FOUND_PORTS+=("$port")
+        fi
+    fi
+done
+```
+
+**Multi-Terminal Support:**
+
+```bash
+case "$TERMINAL" in
+    ghostty)
+        open -na "Ghostty.app" --args -e "$SHELL_CMD" -c "$INNER_CMD"
+        ;;
+    iterm2|iterm)
+        osascript <<EOF
+tell application "iTerm2"
+    create window with default profile
+    tell current session of current window
+        write text "cd '$WORKTREE_PATH' && $CLAUDE_CMD"
+    end tell
+end tell
+EOF
+        ;;
+    tmux)
+        tmux new-session -d -s "$SESSION_NAME" -c "$WORKTREE_PATH" ...
+        ;;
+    # ... wezterm, kitty, alacritty
+esac
+```
+
+## Data Flow Diagrams
+
+### Planning Flow (/plan)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ User: /plan "implement user authentication"                     │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Phase 0: Worktree Check                                         │
+│ IF on protected branch (main, master, develop):                 │
+│   → Recommend /worktree-create                                  │
+│   → STOP (user restarts in worktree)                           │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Phase 1: Socratic Elicitation                                   │
+│ - Ask 3-4 questions per round                                   │
+│ - Continue until 7 clarity checkpoints met                      │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Phase 2: Parallel Research                                      │
+│ PARALLEL:                                                       │
+│   Task subagent 1: External research                           │
+│   Task subagent 2: Codebase analysis                           │
+│   Task subagent 3: Security assessment                         │
+│   Task subagent 4: Technical feasibility                       │
+│ WAIT FOR ALL → Synthesize                                       │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ Phases 3-6: Documentation Generation                            │
+│ 3: REQUIREMENTS.md (from elicitation)                          │
+│ 4: ARCHITECTURE.md (from research synthesis)                   │
+│ 5: IMPLEMENTATION_PLAN.md (phased tasks)                       │
+│ 6: Cross-reference check & user approval                       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Document Sync Flow (/implement)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Task status changes: pending → in-progress → done               │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. Update PROGRESS.md (source of truth)                         │
+│    - Task row: status, started, completed timestamps            │
+│    - Recalculate phase progress %                               │
+│    - Recalculate overall progress %                             │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 2. Sync IMPLEMENTATION_PLAN.md                                  │
+│    - Find matching task checkbox                                │
+│    - Update: [ ] → [x] or vice versa                           │
+│    - Update status emoji                                        │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 3. Update README.md frontmatter                                 │
+│    - Update status field if phase changes                       │
+│    - Update progress percentage                                 │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 4. Add CHANGELOG.md entry (if significant)                      │
+│    - Record what changed                                        │
+│    - Include timestamp                                          │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Error Handling
+
+### File Operation Errors
+
+```python
+class LogWriter:
+    def append_entry(self, entry: LogEntry) -> None:
+        try:
+            # ... atomic write
+        except IOError as e:
+            # Log but don't raise - prompt capture is optional
+            print(f"Log write failed: {e}", file=sys.stderr)
+```
+
+### Worktree Script Errors
+
+```bash
+# Always verify prerequisites
+if ! command -v jq &> /dev/null; then
+    echo "Error: jq is required" >&2
+    exit 1
+fi
+
+# Verify paths exist
+if [ ! -d "$WORKTREE_PATH" ]; then
+    echo "Error: Worktree not found: $WORKTREE_PATH" >&2
+    exit 1
+fi
+```
+
+## Security Considerations
+
+### 1. Secret Filtering
+
+All prompts pass through the filter pipeline before logging. Secrets are detected using regex patterns and replaced with type markers.
+
+**Limitations:**
+- Pattern-based detection may miss custom secret formats
+- Very long secrets may not be fully matched
+- Context around secrets is preserved
+
+### 2. File Permissions
+
+- Log files created with default umask
+- Registry file at `~/.claude/` inherits directory permissions
+- No explicit permission hardening
+
+### 3. Code Injection Prevention
+
+- Template variables use simple string substitution
+- Shell scripts quote all variables
+- No dynamic code execution or string-to-code conversion
+
+## Performance Considerations
+
+### Filter Performance
+
+The filter is invoked when processing prompts. Performance targets:
+
+| Operation | Target | Actual |
+|-----------|--------|--------|
+| JSON parse | < 1ms | ~0.5ms |
+| Filter pipeline | < 10ms | ~5ms |
+| Log write | < 20ms | ~10ms |
+| **Total** | < 50ms | ~16ms |
+
+### Log File Growth
+
+Each prompt adds ~500-2000 bytes to the log. For typical sessions:
+
+| Session Length | Prompts | Log Size |
+|---------------|---------|----------|
+| Short (30 min) | ~20 | ~20 KB |
+| Medium (2 hr) | ~80 | ~80 KB |
+| Long (8 hr) | ~300 | ~300 KB |
+
+Logs are per-project and cleared on close-out.
+
+## Extensibility
+
+### Adding New Commands
+
+1. Create `commands/newcmd.md`
+2. Add YAML frontmatter
+3. Define role, protocol, edge cases
+4. Reinstall plugin
+
+### Adding Secret Patterns
+
+Edit `filters/pipeline.py`:
+
+```python
+SECRET_PATTERNS = [
+    # Existing patterns...
+    (r'new_pattern_regex', 'new_secret_type'),
+]
+```
+
+### Adding Terminal Support
+
+Edit `skills/worktree-manager/scripts/launch-agent.sh`:
+
+```bash
+case "$TERMINAL" in
+    # Existing terminals...
+    new-terminal)
+        new-terminal-command --working-dir "$WORKTREE_PATH" ...
+        ;;
+esac
+```
+
+## SaCP Integration Architecture
+
+### Overview
+
+The spec-as-control-plane (SaCP) methodology is integrated as a quality layer that wraps the existing lifecycle machinery without replacing it. SaCP adds:
+
+1. **Pre-planning**: Triage gate classifies work type before workspace creation
+2. **Planning**: Q5 scope discipline + SCENARIOS.md holdout generation
+3. **Approval**: SCENARIOS.md becomes a required artifact gate
+4. **Implementation**: Convergence gate replaces "CI passes = done" with "90%+ user satisfaction"
+
+### Component integration map
+
+```text
+plan.md (lifecycle)          SaCP quality layer
+     │                              │
+     ├── Phase 0: Init              │
+     ├── Phase 0.5: Triage ←────────┤ Fix/Feature/System classification
+     ├── Phase 1: Elicitation       │
+     │   ├── Q1-Q4 (existing)       │
+     │   └── Q5 Scope ←─────────────┤ "What is NOT" from C3 interview question
+     ├── Phase 2: Research          │
+     ├── Phase 3: Requirements      │
+     │   ├── REQUIREMENTS.md        │
+     │   └── SCENARIOS.md ←─────────┤ Holdout scenarios from scenarios-template.md
+     ├── Phase 4: Architecture      │
+     ├── Phase 5: Implementation    │
+     └── Phase 6: Finalization      │
+
+implement.md (lifecycle)     SaCP quality layer
+     │                              │
+     ├── Phase 0: Load state        │
+     ├── Phases 1-N: Tasks          │
+     │   └── (NEVER reads SCENARIOS.md) ←─ Holdout property protection
+     ├── Convergence Gate ←─────────┤ 90%+ satisfaction vs SCENARIOS.md
+     └── Auto-handoff               │
+```
+
+### Artifact ownership
+
+| Artifact | Owner | Read by | Holdout? |
+|---|---|---|---|
+| REQUIREMENTS.md | /plan | /approve, /implement, /complete | No |
+| SCENARIOS.md | /plan | Convergence gate only | **Yes** |
+| ARCHITECTURE.md | /plan | /approve, /implement | No |
+| IMPLEMENTATION_PLAN.md | /plan | /implement | No |
+| PROGRESS.md | /implement | /implement, /status | No |
+| RETROSPECTIVE.md | /complete | — | No |
+
+### SaCP reference library (./references/)
+
+These files are consulted by the plan command for complex specs. They are not inlined into commands to preserve instruction-following quality.
+
+- `interview-protocol.md`: When to run full discovery vs skip (Fix path)
+- `evidence-protocol.md`: Code-level evidence for fixes; context-level for features
+- `system-context-protocol.md`: System maps, boundary contracts, blast radius (Tier 2)
+- `null-contract.md`: Null handling contracts for data-scoring systems (domain-specific)
+
+### Shapiro Level lifecycle
+
+```text
+Input: User describes work
+          │
+          ▼
+     Triage Gate (Step 0.5)
+     ┌─────────────────────────┐
+     │ Fix/Bug    → Level 2 or 3  │ → Lightweight: REQUIREMENTS.md + SCENARIOS.md
+     │ Feature    → Level 4   │ → Standard: all 7 docs
+     │ System     → Level 5   │ → Standard + system context reference
+     └─────────────────────────┘
+          │
+          ▼
+     shapiro_level stored in README.md frontmatter
+          │
+          ▼
+     Convergence gate: skip if level 2 or 3, run if level 4 or 5
+```
+
+## Future Considerations
+
+1. **Test Suite** - Add unit tests for filters, integration tests for commands
+2. **Metrics Aggregation** - Cross-project analytics from retrospectives
+3. **Remote Registry** - Sync worktree registry across machines
+4. **Custom Templates** - User-defined project templates
+5. **Webhook Integration** - Post events to external systems

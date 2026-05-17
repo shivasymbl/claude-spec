@@ -1,0 +1,39 @@
+{
+  "name": "claude-spec",
+  "version": "0.16.1",
+  "description": "Claude Code plugin for project specification and implementation lifecycle management",
+  "author": {
+    "name": "Asymbl Inc",
+    "url": "https://github.com/asymblinc"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/asymblinc/claude-spec",
+  "homepage": "https://github.com/asymblinc/claude-spec#readme",
+  "keywords": [
+    "architecture",
+    "planning",
+    "specification",
+    "worktree",
+    "implementation-tracking",
+    "claude-code",
+    "approval",
+    "governance"
+  ],
+  "commands": [
+    "./commands/approve.md",
+    "./commands/deep-clean.md",
+    "./commands/complete.md",
+    "./commands/deep-explore.md",
+    "./commands/deep-research.md",
+    "./commands/implement.md",
+    "./commands/plan.md",
+    "./commands/status.md",
+    "./commands/worktree-cleanup.md",
+    "./commands/worktree-create.md",
+    "./commands/worktree-setup.md",
+    "./commands/worktree-status.md"
+  ],
+  "skills": [
+    "./skills/worktree-manager"
+  ]
+}
