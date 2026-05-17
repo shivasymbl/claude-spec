@@ -1,5 +1,5 @@
 {
-  "name": "asymblinc",
+  "name": "shivasymbl",
   "owner": {
     "name": "Asymbl Inc",
     "email": "engineering@asymbl.com",
@@ -17,5 +17,5 @@
       "version": "0.16.1"
     }
   ],
-  "id": "asymblinc"
+  "id": "shivasymbl"
 }
